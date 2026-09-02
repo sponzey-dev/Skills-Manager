@@ -173,6 +173,11 @@
         "icon": "$(edit)"
       },
       {
+        "command": "sponzeySkills.synchronizeManagedSkillName",
+        "title": "Sponzey Skills: Synchronize Managed Skill Name",
+        "icon": "$(sync)"
+      },
+      {
         "command": "sponzeySkills.deleteSourceSkill",
         "title": "Sponzey Skills: Delete Source Skill",
         "icon": "$(trash)"

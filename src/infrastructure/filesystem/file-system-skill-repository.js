@@ -1,9 +1,12 @@
 import {
   access,
   cp,
+  lstat,
   mkdir,
+  mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -25,6 +28,11 @@ const DEFAULT_ANALYSIS_ARTIFACT_BUDGET = Object.freeze({
 });
 
 export class FileSystemSkillRepository {
+  constructor({ manifestInspector = inspectRootSkillManifest, sourceCleanup = cleanupSourcePath } = {}) {
+    this.manifestInspector = manifestInspector;
+    this.sourceCleanup = sourceCleanup;
+  }
+
   async createSourceSkill({ repositoryPath, skillName, description, body }) {
     const destinationResult = resolveSourceDestination({
       repositoryPath,
@@ -40,26 +48,24 @@ export class FileSystemSkillRepository {
       return sourceNameConflict();
     }
 
-    return withFileSystemResult(async () => {
-      await mkdir(sourcePath, { recursive: true });
+    return saveVerifiedSource({
+      sourcePath,
+      skillName,
+      operationName: "create-source-skill",
+      manifestInspector: this.manifestInspector,
+      sourceCleanup: this.sourceCleanup,
+      writeStagedSource: async (stagedSourcePath) => {
+      await mkdir(stagedSourcePath, { recursive: true });
       await writeFile(
-        path.join(sourcePath, "SKILL.md"),
+        path.join(stagedSourcePath, "SKILL.md"),
         renderSkillMd({
           name: skillName,
           description,
           body,
         }),
       );
-
-      return {
-        ok: true,
-        source: createSkillSource({
-          id: skillName,
-          name: skillName,
-          sourcePath,
-        }).value,
-      };
-    }, "create-source-skill");
+      },
+    });
   }
 
   async importSourceSkill({
@@ -68,6 +74,11 @@ export class FileSystemSkillRepository {
     skillName,
     origin,
   }) {
+    const manifestResult = await this.manifestInspector(externalSourcePath);
+    if (!manifestResult.ok) {
+      return manifestResult;
+    }
+
     const destinationResult = resolveSourceDestination({
       repositoryPath,
       skillName,
@@ -82,26 +93,24 @@ export class FileSystemSkillRepository {
       return sourceNameConflict();
     }
 
-    return withFileSystemResult(async () => {
-      await cp(externalSourcePath, sourcePath, {
+    return saveVerifiedSource({
+      sourcePath,
+      skillName,
+      operationName: "import-source-skill",
+      manifestInspector: this.manifestInspector,
+      sourceCleanup: this.sourceCleanup,
+      writeStagedSource: async (stagedSourcePath) => {
+      await cp(externalSourcePath, stagedSourcePath, {
         recursive: true,
         errorOnExist: true,
         force: false,
       });
       await writeFile(
-        path.join(sourcePath, SOURCE_METADATA_FILE),
+        path.join(stagedSourcePath, SOURCE_METADATA_FILE),
         `${JSON.stringify({ origin }, null, 2)}\n`,
       );
-
-      return {
-        ok: true,
-        source: createSkillSource({
-          id: skillName,
-          name: skillName,
-          sourcePath,
-        }).value,
-      };
-    }, "import-source-skill");
+      },
+    });
   }
 
   async copyTargetSkillToMainRepository({
@@ -188,6 +197,7 @@ export class FileSystemSkillRepository {
       const skillsPath = path.join(repositoryPath, "skills");
       const entries = await readOptionalDirectoryEntries(skillsPath);
       const sources = [];
+      const diagnostics = [];
 
       for (const entry of entries) {
         if (!entry.isDirectory()) {
@@ -195,10 +205,15 @@ export class FileSystemSkillRepository {
         }
 
         const sourcePath = path.join(skillsPath, entry.name);
-        const skillMdPath = path.join(sourcePath, "SKILL.md");
-        const hasSkillMd = await canAccess(skillMdPath);
-
-        if (!hasSkillMd) {
+        const manifestResult = await this.manifestInspector(sourcePath);
+        if (!manifestResult.ok) {
+          diagnostics.push({
+            ...manifestResult.error,
+            severity: "warning",
+            message: "Source skill folder is missing SKILL.md.",
+            recommendation: "Add SKILL.md at the root or remove the invalid source folder.",
+            skillName: entry.name,
+          });
           continue;
         }
 
@@ -215,10 +230,12 @@ export class FileSystemSkillRepository {
 
       sources.sort((left, right) => left.name.localeCompare(right.name));
 
-      return {
+      const result = {
         ok: true,
         sources,
       };
+      if (diagnostics.length > 0) result.diagnostics = diagnostics;
+      return result;
     }, "scan-source-skills");
   }
 
@@ -327,12 +344,55 @@ export class FileSystemSkillRepository {
     if (!oldDestination.ok) return oldDestination;
     if (!newDestination.ok) return newDestination;
 
-    if (await canAccess(newDestination.sourcePath)) {
-      return sourceNameConflict();
+    const caseOnlyRename = await isCaseOnlyRename({ oldDestination, newDestination });
+    if ((await canAccess(newDestination.sourcePath)) && !caseOnlyRename) return sourceNameConflict();
+
+    const oldManifestPath = path.join(oldDestination.sourcePath, "SKILL.md");
+    let manifestText;
+    try {
+      manifestText = await readFile(oldManifestPath, "utf8");
+    } catch (error) {
+      return error?.code === "ENOENT"
+        ? sourceManifestNameInvalid()
+        : fileSystemError("read-source-skill-manifest", error);
     }
+    const manifestEdit = editTopLevelSkillName({
+      skillMarkdown: manifestText,
+      newName,
+    });
+    if (!manifestEdit.ok) return manifestEdit;
 
     return withFileSystemResult(async () => {
-      await rename(oldDestination.sourcePath, newDestination.sourcePath);
+      const stagedManifestName = `.sponzey-rename-${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2)}.tmp`;
+      const stagedManifestPath = path.join(
+        oldDestination.sourcePath,
+        stagedManifestName,
+      );
+      await writeFile(stagedManifestPath, manifestEdit.skillMarkdown, { flag: "wx" });
+      await renameSourceDirectory({
+        oldSourcePath: oldDestination.sourcePath,
+        newSourcePath: newDestination.sourcePath,
+        caseOnlyRename,
+      });
+      try {
+        await rename(
+          path.join(newDestination.sourcePath, stagedManifestName),
+          path.join(newDestination.sourcePath, "SKILL.md"),
+        );
+      } catch (error) {
+        try {
+          await renameSourceDirectory({
+            oldSourcePath: newDestination.sourcePath,
+            newSourcePath: oldDestination.sourcePath,
+            caseOnlyRename,
+          });
+        } catch {
+          return sourceRenameRecoveryRequired();
+        }
+        throw error;
+      }
       return {
         ok: true,
         source: createSkillSource({
@@ -415,8 +475,12 @@ export class FileSystemSkillRepository {
       return sourceNameConflict();
     }
 
-    return withFileSystemResult(async () => {
-      const archive = JSON.parse(await readFile(archivePath, "utf8"));
+    let archive;
+    try {
+      archive = JSON.parse(await readFile(archivePath, "utf8"));
+    } catch (error) {
+      return fileSystemError("import-skill-archive-to-main-repository", error);
+    }
       if (archive?.format !== "sponzey-skill-archive-v1") {
         return {
           ok: false,
@@ -428,13 +492,19 @@ export class FileSystemSkillRepository {
         };
       }
 
-      await mkdir(destination.sourcePath, { recursive: true });
+    return saveVerifiedSource({
+      sourcePath: destination.sourcePath,
+      skillName,
+      operationName: "import-skill-archive-to-main-repository",
+      manifestInspector: this.manifestInspector,
+      sourceCleanup: this.sourceCleanup,
+      writeStagedSource: async (stagedSourcePath) => {
       await writeArchiveFiles({
-        rootPath: destination.sourcePath,
+        rootPath: stagedSourcePath,
         files: archive.files ?? {},
       });
       await writeFile(
-        path.join(destination.sourcePath, SOURCE_METADATA_FILE),
+        path.join(stagedSourcePath, SOURCE_METADATA_FILE),
         `${JSON.stringify(
           {
             origin: {
@@ -446,16 +516,8 @@ export class FileSystemSkillRepository {
           2,
         )}\n`,
       );
-
-      return {
-        ok: true,
-        source: createSkillSource({
-          id: skillName,
-          name: skillName,
-          sourcePath: destination.sourcePath,
-        }).value,
-      };
-    }, "import-skill-archive-to-main-repository");
+      },
+    });
   }
 
   async scanBackups({ repositoryPath }) {
@@ -515,17 +577,23 @@ export class FileSystemSkillRepository {
       return sourceNameConflict();
     }
 
-    return withFileSystemResult(async () => {
-      await cp(backupPath, destination.sourcePath, {
+    return saveVerifiedSource({
+      sourcePath: destination.sourcePath,
+      skillName,
+      operationName: "promote-backup-to-source",
+      manifestInspector: this.manifestInspector,
+      sourceCleanup: this.sourceCleanup,
+      writeStagedSource: async (stagedSourcePath) => {
+      await cp(backupPath, stagedSourcePath, {
         recursive: true,
         errorOnExist: true,
         force: false,
       });
-      await rm(path.join(destination.sourcePath, BACKUP_METADATA_FILE), {
+      await rm(path.join(stagedSourcePath, BACKUP_METADATA_FILE), {
         force: true,
       });
       await writeFile(
-        path.join(destination.sourcePath, SOURCE_METADATA_FILE),
+        path.join(stagedSourcePath, SOURCE_METADATA_FILE),
         `${JSON.stringify(
           {
             origin: {
@@ -537,15 +605,8 @@ export class FileSystemSkillRepository {
           2,
         )}\n`,
       );
-      return {
-        ok: true,
-        source: createSkillSource({
-          id: skillName,
-          name: skillName,
-          sourcePath: destination.sourcePath,
-        }).value,
-      };
-    }, "promote-backup-to-source");
+      },
+    });
   }
 
   async deleteBackup({ backupPath }) {
@@ -556,6 +617,28 @@ export class FileSystemSkillRepository {
         deletedBackupPath: normalizePath(backupPath),
       };
     }, "delete-backup");
+  }
+}
+
+async function isCaseOnlyRename({ oldDestination, newDestination }) {
+  if (oldDestination.sourcePath === newDestination.sourcePath) return false;
+  if (oldDestination.sourcePath.toLocaleLowerCase() !== newDestination.sourcePath.toLocaleLowerCase()) return false;
+  try {
+    return normalizePath(await realpath(oldDestination.sourcePath)) === normalizePath(await realpath(newDestination.sourcePath));
+  } catch {
+    return false;
+  }
+}
+
+async function renameSourceDirectory({ oldSourcePath, newSourcePath, caseOnlyRename }) {
+  if (!caseOnlyRename) return rename(oldSourcePath, newSourcePath);
+  const temporaryPath = path.join(path.dirname(oldSourcePath), `.sponzey-case-rename-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  await rename(oldSourcePath, temporaryPath);
+  try {
+    await rename(temporaryPath, newSourcePath);
+  } catch (error) {
+    try { await rename(temporaryPath, oldSourcePath); } catch { throw sourceRenameRecoveryRequired(); }
+    throw error;
   }
 }
 
@@ -882,6 +965,202 @@ async function readOptionalDirectoryEntries(directoryPath) {
     }
 
     throw error;
+  }
+}
+
+async function inspectRootSkillManifest(sourcePath) {
+  const skillMdPath = path.join(sourcePath, "SKILL.md");
+  try {
+    const manifestStats = await lstat(skillMdPath);
+    if (!manifestStats.isFile()) {
+      return {
+        ok: false,
+        error: {
+          code: "source-skill-md-not-regular",
+          severity: "error",
+          message: "Source SKILL.md must be a regular file.",
+          recommendation: "Replace SKILL.md with a readable regular file at the skill root.",
+        },
+      };
+    }
+    await access(skillMdPath);
+    return { ok: true };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return {
+        ok: false,
+        error: {
+          code: "source-skill-md-missing",
+          severity: "error",
+          message: "Source skill must contain SKILL.md at its root.",
+          recommendation: "Choose a skill folder that contains SKILL.md at its root.",
+        },
+      };
+    }
+    if (error?.code === "EACCES") {
+      return {
+        ok: false,
+        error: {
+          code: "source-skill-md-unreadable",
+          severity: "error",
+          message: "Source SKILL.md cannot be read.",
+          recommendation: "Grant read access to SKILL.md and try again.",
+        },
+      };
+    }
+    return fileSystemError("inspect-source-skill-manifest", error);
+  }
+}
+
+function editTopLevelSkillName({ skillMarkdown, newName }) {
+  const opening = /^\uFEFF?---(\r?\n)/.exec(skillMarkdown);
+  if (!opening) return sourceManifestNameInvalid();
+
+  const openingLength = opening[0].length;
+  const closing = /\r?\n---(?=\r?\n|$)/g;
+  closing.lastIndex = openingLength;
+  const closingMatch = closing.exec(skillMarkdown);
+  if (!closingMatch) return sourceManifestNameInvalid();
+
+  const frontmatter = skillMarkdown.slice(openingLength, closingMatch.index);
+  const nameMatches = [...frontmatter.matchAll(/^(name:[ \t]*)([^#\r\n]*?)([ \t]*(?:#.*)?)$/gm)];
+  if (nameMatches.length > 1) return sourceManifestNameInvalid();
+
+  if (nameMatches.length === 0) {
+    const lineEnding = opening[1];
+    return {
+      ok: true,
+      skillMarkdown:
+        skillMarkdown.slice(0, closingMatch.index) +
+        `${frontmatter.length > 0 && !frontmatter.endsWith("\n") && !frontmatter.endsWith("\r") ? lineEnding : ""}name: ${newName}` +
+        skillMarkdown.slice(closingMatch.index),
+    };
+  }
+
+  const [match] = nameMatches;
+  const value = match[2].trim();
+  if (!editableNameScalar(value)) return sourceManifestNameInvalid();
+  const nameStart = openingLength + match.index;
+  const nameEnd = nameStart + match[0].length;
+  return {
+    ok: true,
+    skillMarkdown:
+      skillMarkdown.slice(0, nameStart) +
+      `${match[1]}${newName}${match[3]}` +
+      skillMarkdown.slice(nameEnd),
+  };
+}
+
+function editableNameScalar(value) {
+  if (value.length === 0 || /^[\[{]|[|>]/.test(value)) return false;
+  if (value.startsWith('"') || value.startsWith("'")) {
+    return value.length > 1 && value.at(-1) === value[0];
+  }
+  return !/[\[\]{}]/.test(value);
+}
+
+function sourceManifestNameInvalid() {
+  return {
+    ok: false,
+    error: {
+      code: "source-manifest-name-invalid",
+      severity: "error",
+      message: "Source SKILL.md must contain one editable top-level name field.",
+      recommendation: "Fix the SKILL.md frontmatter name field before renaming the source.",
+    },
+  };
+}
+
+function sourceRenameRecoveryRequired() {
+  return {
+    ok: false,
+    recoveryRequired: true,
+    error: {
+      code: "source-rename-recovery-required",
+      severity: "error",
+      message: "Source rename could not be restored automatically.",
+      recommendation: "Refresh Sponzey Skills and repair the source folder before retrying.",
+    },
+  };
+}
+
+async function saveVerifiedSource({
+  sourcePath,
+  skillName,
+  operationName,
+  manifestInspector = inspectRootSkillManifest,
+  sourceCleanup = cleanupSourcePath,
+  writeStagedSource,
+}) {
+  let stageRootPath = null;
+  let committed = false;
+
+  try {
+    stageRootPath = await mkdtemp(
+      path.join(path.dirname(sourcePath), `.${skillName}-staging-`),
+    );
+    const stagedSourcePath = path.join(stageRootPath, "source");
+    await writeStagedSource(stagedSourcePath);
+
+    const stagedManifestResult = await manifestInspector(stagedSourcePath);
+    if (!stagedManifestResult.ok) {
+      return cleanupRejectedSource({
+        rejectedResult: stagedManifestResult,
+        cleanupPath: stageRootPath,
+        sourceCleanup,
+      });
+    }
+
+    await rename(stagedSourcePath, sourcePath);
+    committed = true;
+    const committedManifestResult = await manifestInspector(sourcePath);
+    if (!committedManifestResult.ok) {
+      return cleanupRejectedSource({
+        rejectedResult: committedManifestResult,
+        cleanupPath: sourcePath,
+        sourceCleanup,
+      });
+    }
+
+    await rm(stageRootPath, { recursive: true, force: true });
+    return {
+      ok: true,
+      source: createSkillSource({
+        id: skillName,
+        name: skillName,
+        sourcePath,
+      }).value,
+    };
+  } catch (error) {
+    const cleanupPath = committed ? sourcePath : stageRootPath;
+    if (cleanupPath) {
+      const cleanupResult = await sourceCleanup(cleanupPath);
+      if (!cleanupResult.ok) return cleanupResult;
+    }
+    return fileSystemError(operationName, error);
+  }
+}
+
+async function cleanupRejectedSource({ rejectedResult, cleanupPath, sourceCleanup = cleanupSourcePath }) {
+  const cleanupResult = await sourceCleanup(cleanupPath);
+  return cleanupResult.ok ? rejectedResult : cleanupResult;
+}
+
+async function cleanupSourcePath(sourcePath) {
+  try {
+    await rm(sourcePath, { recursive: true, force: true });
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      recoveryRequired: true,
+      error: {
+        code: "source-cleanup-failed",
+        severity: "error",
+        message: "An incomplete source skill could not be removed.",
+        recommendation: "Remove the incomplete source folder manually, then refresh Sponzey Skills.",
+      },
+    };
   }
 }
 

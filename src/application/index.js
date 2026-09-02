@@ -49,6 +49,7 @@ export {
   promoteBackupToSkillSource,
   renameSourceSkill,
   restoreBackupToTarget,
+  synchronizeManagedSkillName,
   updateAppliedCopyFromSource,
 } from "./skill/skill-operation-use-cases.js";
 export {

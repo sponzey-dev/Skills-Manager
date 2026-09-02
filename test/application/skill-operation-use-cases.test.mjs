@@ -9,7 +9,9 @@ import {
   deleteSourceSkill,
   getSkillDetail,
   openSkillPath,
+  renameSourceSkill,
   restoreBackupToTarget,
+  synchronizeManagedSkillName,
   updateAppliedCopyFromSource,
 } from "../../src/application/index.js";
 
@@ -1238,4 +1240,381 @@ test("convertAppliedSkillMode delegates target writes to target store", async ()
       },
     },
   ]);
+});
+
+test("renameSourceSkill preserves stable index identity while updating source name path and hash", async () => {
+  const calls = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo" },
+    input: {
+      source: {
+        id: "source-alpha-stable",
+        name: "alpha",
+        sourcePath: "/repo/skills/alpha",
+      },
+      newName: "beta",
+    },
+    skillRepository: {
+      async renameSourceSkill(input) {
+        calls.push(["renameSourceSkill", input]);
+        return {
+          ok: true,
+          source: { id: "beta", name: "beta", sourcePath: "/repo/skills/beta" },
+        };
+      },
+    },
+    hashPort: {
+      async hashDirectory(input) {
+        calls.push(["hashDirectory", input]);
+        return { ok: true, hash: "hash-beta" };
+      },
+    },
+    repositoryIndexStore: {
+      async readRepositoryIndex(input) {
+        calls.push(["readRepositoryIndex", input]);
+        return {
+          ok: true,
+          index: {
+            schemaVersion: 1,
+            indexedAt: "2026-08-01T00:00:00.000Z",
+            sources: [
+              {
+                sourceId: "source-alpha-stable",
+                sourceName: "alpha",
+                sourcePath: "/repo/skills/alpha",
+                sourceHash: "hash-alpha",
+                origin: "created",
+                indexStatus: "indexed",
+                indexedAt: "2026-08-01T00:00:00.000Z",
+              },
+            ],
+          },
+        };
+      },
+      async writeRepositoryIndex(input) {
+        calls.push(["writeRepositoryIndex", input]);
+        return { ok: true };
+      },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.source, {
+    id: "source-alpha-stable",
+    name: "beta",
+    sourcePath: "/repo/skills/beta",
+  });
+  assert.deepEqual(calls, [
+    ["readRepositoryIndex", { repositoryPath: "/repo" }],
+    [
+      "renameSourceSkill",
+      { repositoryPath: "/repo", oldName: "alpha", newName: "beta" },
+    ],
+    ["hashDirectory", { directoryPath: "/repo/skills/beta" }],
+    [
+      "writeRepositoryIndex",
+      {
+        repositoryPath: "/repo",
+        index: {
+          schemaVersion: 1,
+          indexedAt: "2026-08-01T00:00:00.000Z",
+          sources: [
+            {
+              sourceId: "source-alpha-stable",
+              sourceName: "beta",
+              sourcePath: "/repo/skills/beta",
+              sourceHash: "hash-beta",
+              previousSourcePaths: ["/repo/skills/alpha"],
+              origin: "created",
+              indexStatus: "indexed",
+              indexedAt: "2026-08-01T00:00:00.000Z",
+            },
+          ],
+        },
+      },
+    ],
+  ]);
+  assert.deepEqual(result.steps, [
+    "ValidatingInput",
+    "ReadingRepositoryIndex",
+    "RenamingSource",
+    "HashingSource",
+    "WritingRepositoryIndex",
+    "Completed",
+  ]);
+});
+
+test("renameSourceSkill restores source when repository index write fails", async () => {
+  const renameCalls = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo" },
+    input: { source: { id: "stable", name: "alpha" }, newName: "beta" },
+    skillRepository: {
+      async renameSourceSkill(input) {
+        renameCalls.push(input);
+        return { ok: true, source: { id: input.newName, name: input.newName, sourcePath: `/repo/skills/${input.newName}` } };
+      },
+    },
+    hashPort: { async hashDirectory() { return { ok: true, hash: "new-hash" }; } },
+    repositoryIndexStore: {
+      async readRepositoryIndex() { return { ok: true, index: { schemaVersion: 1, indexedAt: "2026-08-01T00:00:00.000Z", sources: [] } }; },
+      async writeRepositoryIndex() { return { ok: false, error: { code: "repository-index-write-failed", severity: "error", message: "Repository index metadata could not be written." } }; },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryRequired, undefined);
+  assert.equal(result.diagnostics[0].code, "repository-index-write-failed");
+  assert.deepEqual(renameCalls, [
+    { repositoryPath: "/repo", oldName: "alpha", newName: "beta" },
+    { repositoryPath: "/repo", oldName: "beta", newName: "alpha" },
+  ]);
+  assert.deepEqual(result.steps.slice(-2), ["RollingBack", "RolledBack"]);
+});
+
+test("renameSourceSkill updates only exact managed symlinks in open targets", async () => {
+  const renamedTargets = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:codex", scope: "global", targetPath: "/targets/codex" }], projectTargets: [] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill({ newName }) { return { ok: true, source: { id: newName, name: newName, sourcePath: `/repo/skills/${newName}` } }; } },
+    targetStore: {
+      async scanAppliedSkills() { return { ok: true, appliedSkills: [
+        { name: "alpha", kind: "managed-symlink", targetPath: "/targets/codex/alpha", sourcePath: "/repo/skills/alpha" },
+        { name: "external", kind: "external", targetPath: "/targets/codex/external" },
+      ], diagnostics: [] }; },
+      async renameManagedSymlink(input) { renamedTargets.push(input); return { ok: true }; },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(renamedTargets, [{ oldTargetPath: "/targets/codex/alpha", targetRootPath: "/targets/codex", skillName: "beta", sourcePath: "/repo/skills/beta" }]);
+});
+
+test("renameSourceSkill updates exact managed Global and Project placements without touching external entries", async () => {
+  const calls = [];
+  const result = await renameSourceSkill({
+    context: {
+      mainRepositoryPath: "/repo",
+      globalTargets: [{ id: "global:codex", targetPath: "/targets/codex" }],
+      projectTargets: [{ id: "project:workspace", targetPath: "/workspace/.agents/skills" }],
+    },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta", modifiedCopyConfirmed: true },
+    skillRepository: { async renameSourceSkill({ newName }) { return { ok: true, source: { id: "stable", name: newName, sourcePath: `/repo/skills/${newName}` } }; } },
+    targetStore: {
+      async scanAppliedSkills({ targetPath }) {
+        if (targetPath === "/targets/codex") return { ok: true, appliedSkills: [
+          { name: "alpha", kind: "managed-symlink", targetPath: "/targets/codex/alpha", sourcePath: "/repo/skills/alpha" },
+          { name: "external", kind: "external", targetPath: "/targets/codex/external" },
+        ] };
+        return { ok: true, appliedSkills: [
+          { name: "alpha", kind: "managed-copy", targetPath: "/workspace/.agents/skills/alpha", metadata: { sourceSkillId: "stable", sourceHash: "same", targetHash: "same" } },
+          { name: "backup", kind: "backup", targetPath: "/workspace/.agents/skills/backup" },
+        ] };
+      },
+      async renameManagedSymlink(input) { calls.push(["symlink", input]); return { ok: true, targetPath: "/targets/codex/beta" }; },
+      async renameManagedCopy(input) { calls.push(["copy", input]); return { ok: true, targetPath: "/workspace/.agents/skills/beta" }; },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    ["symlink", { oldTargetPath: "/targets/codex/alpha", targetRootPath: "/targets/codex", skillName: "beta", sourcePath: "/repo/skills/beta" }],
+    ["copy", { oldTargetPath: "/workspace/.agents/skills/alpha", targetRootPath: "/workspace/.agents/skills", skillName: "beta", metadata: { sourceSkillId: "stable", sourceHash: "same", targetHash: "same", sourcePath: "/repo/skills/beta" } }],
+  ]);
+});
+
+test("renameSourceSkill rejects an ambiguous managed identity before changing the source", async () => {
+  let sourceRenameCalled = false;
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:codex", targetPath: "/targets/codex" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill({ newName }) { sourceRenameCalled = true; return { ok: true, source: { id: "stable", name: newName, sourcePath: `/repo/skills/${newName}` } }; } },
+    targetStore: {
+      async scanAppliedSkills() {
+        return { ok: true, appliedSkills: [{
+          name: "alpha", kind: "managed-copy", targetPath: "/targets/codex/alpha",
+          metadata: { sourceSkillId: "stable", sourcePath: "/other-repository/skills/alpha", sourceHash: "same", targetHash: "same" },
+        }] };
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0].code, "managed-placement-identity-ambiguous");
+  assert.equal(sourceRenameCalled, false);
+  assert.deepEqual(result.steps, ["ValidatingInput", "ScanningManagedTargets", "AmbiguousIdentity"]);
+});
+
+test("renameSourceSkill succeeds when an open target has no managed placement", async () => {
+  const scans = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:missing", targetPath: "/targets/missing" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill({ newName }) { return { ok: true, source: { id: "stable", name: newName, sourcePath: `/repo/skills/${newName}` } }; } },
+    targetStore: {
+      async scanAppliedSkills(input) { scans.push(input); return { ok: true, appliedSkills: [], diagnostics: [] }; },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(scans, [{ targetPath: "/targets/missing", knownSourcePaths: ["/repo/skills/alpha"] }]);
+  assert.equal(result.steps.at(-1), "Completed");
+});
+
+test("renameSourceSkill rejects an unreadable target before changing the source", async () => {
+  let sourceRenameCalled = false;
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:locked", targetPath: "/targets/locked" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill() { sourceRenameCalled = true; return { ok: true }; } },
+    targetStore: { async scanAppliedSkills() { return { ok: false, error: { code: "filesystem-operation-failed", severity: "error", cause: "EACCES", message: "Target cannot be scanned." } }; } },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0].cause, "EACCES");
+  assert.equal(sourceRenameCalled, false);
+  assert.deepEqual(result.steps, ["ValidatingInput", "ScanningManagedTargets", "TargetScanFailed"]);
+});
+
+test("renameSourceSkill requires confirmation before changing a modified managed copy", async () => {
+  let renameCalled = false;
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:codex", targetPath: "/targets/codex" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill() { renameCalled = true; return { ok: true }; } },
+    targetStore: {
+      async scanAppliedSkills() {
+        return { ok: true, appliedSkills: [{
+          name: "alpha", kind: "managed-copy", targetPath: "/targets/codex/alpha",
+          metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/alpha", sourceHash: "before", targetHash: "modified" },
+        }] };
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.additionalInputRequired, true);
+  assert.equal(result.diagnostics[0].code, "rename-modified-copy-confirmation-required");
+  assert.equal(renameCalled, false);
+});
+
+test("renameSourceSkill renames a confirmed managed copy while retaining its content metadata", async () => {
+  const renamedCopies = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:codex", targetPath: "/targets/codex" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta", modifiedCopyConfirmed: true },
+    skillRepository: { async renameSourceSkill({ newName }) { return { ok: true, source: { id: newName, name: newName, sourcePath: `/repo/skills/${newName}` } }; } },
+    targetStore: {
+      async scanAppliedSkills() {
+        return { ok: true, appliedSkills: [{
+          name: "alpha", kind: "managed-copy", targetPath: "/targets/codex/alpha",
+          metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/alpha", sourceHash: "before", targetHash: "modified", applyMode: "copy" },
+        }] };
+      },
+      async renameManagedCopy(input) { renamedCopies.push(input); return { ok: true, targetPath: "/targets/codex/beta" }; },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(renamedCopies, [{
+    oldTargetPath: "/targets/codex/alpha", targetRootPath: "/targets/codex", skillName: "beta",
+    metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/beta", sourceHash: "before", targetHash: "modified", applyMode: "copy" },
+  }]);
+});
+
+test("renameSourceSkill rolls back updated targets and repository index when a later target update fails", async () => {
+  const sourceRenames = [];
+  const indexWrites = [];
+  const targetRenames = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "first", targetPath: "/targets/one" }, { id: "second", targetPath: "/targets/two" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: { async renameSourceSkill(input) { sourceRenames.push(input); return { ok: true, source: { id: "stable", name: input.newName, sourcePath: `/repo/skills/${input.newName}` } }; } },
+    repositoryIndexStore: {
+      async readRepositoryIndex() { return { ok: true, index: { schemaVersion: 1, sources: [{ sourceId: "stable", sourceName: "alpha", sourcePath: "/repo/skills/alpha" }] } }; },
+      async writeRepositoryIndex(input) { indexWrites.push(input.index); return { ok: true }; },
+    },
+    targetStore: {
+      async scanAppliedSkills({ targetPath }) {
+        return { ok: true, appliedSkills: [{ name: "alpha", kind: "managed-symlink", targetPath: `${targetPath}/alpha`, sourcePath: "/repo/skills/alpha" }] };
+      },
+      async renameManagedSymlink(input) {
+        targetRenames.push(input);
+        return input.oldTargetPath === "/targets/two/alpha"
+          ? { ok: false, error: { code: "target-write-failed", severity: "error", message: "Target update failed." } }
+          : { ok: true, targetPath: input.skillName === "beta" ? "/targets/one/beta" : "/targets/one/alpha" };
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(sourceRenames, [
+    { repositoryPath: "/repo", oldName: "alpha", newName: "beta" },
+    { repositoryPath: "/repo", oldName: "beta", newName: "alpha" },
+  ]);
+  assert.equal(indexWrites.length, 2);
+  assert.equal(indexWrites[1].sources[0].sourceName, "alpha");
+  assert.deepEqual(targetRenames.at(-1), {
+    oldTargetPath: "/targets/one/beta", newTargetPath: "/targets/one/alpha", targetRootPath: "/targets/one", skillName: "alpha", sourcePath: "/repo/skills/alpha",
+  });
+  assert.deepEqual(result.steps.slice(-2), ["RollingBack", "RolledBack"]);
+});
+
+test("renameSourceSkill exposes RecoveryRequired when target failure cannot restore the source", async () => {
+  const sourceRenames = [];
+  const result = await renameSourceSkill({
+    context: { mainRepositoryPath: "/repo", globalTargets: [{ id: "global:codex", targetPath: "/targets/codex" }] },
+    input: { source: { id: "stable", name: "alpha", sourcePath: "/repo/skills/alpha" }, newName: "beta" },
+    skillRepository: {
+      async renameSourceSkill(input) {
+        sourceRenames.push(input);
+        return input.oldName === "beta"
+          ? { ok: false, error: { code: "source-rename-recovery-required", severity: "error", message: "Source restoration failed." } }
+          : { ok: true, source: { id: "stable", name: input.newName, sourcePath: `/repo/skills/${input.newName}` } };
+      },
+    },
+    targetStore: {
+      async scanAppliedSkills() { return { ok: true, appliedSkills: [{ name: "alpha", kind: "managed-symlink", targetPath: "/targets/codex/alpha", sourcePath: "/repo/skills/alpha" }] }; },
+      async renameManagedSymlink() { return { ok: false, error: { code: "target-write-failed", severity: "error", message: "Target update failed." } }; },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryRequired, true);
+  assert.deepEqual(result.diagnostics.map((item) => item.code), ["target-write-failed", "source-rename-recovery-required"]);
+  assert.deepEqual(result.steps.slice(-2), ["RollingBack", "RecoveryRequired"]);
+  assert.deepEqual(sourceRenames, [
+    { repositoryPath: "/repo", oldName: "alpha", newName: "beta" },
+    { repositoryPath: "/repo", oldName: "beta", newName: "alpha" },
+  ]);
+});
+
+test("synchronizeManagedSkillName updates only the confirmed exact stable-id managed copy", async () => {
+  const calls = [];
+  const source = { id: "stable", name: "beta", sourcePath: "/repo/skills/beta" };
+  const diagnostic = {
+    code: "managed-skill-name-out-of-sync", sourceId: "stable",
+    targetPath: "/workspace/.agents/skills", targetSkillPath: "/workspace/.agents/skills/alpha",
+  };
+  const result = await synchronizeManagedSkillName({
+    context: { mainRepositoryPath: "/repo" },
+    input: { source, diagnostic, confirmationProvided: true },
+    targetStore: {
+      async scanAppliedSkills(input) {
+        calls.push(["scan", input]);
+        return { ok: true, appliedSkills: [
+          { name: "alpha", kind: "managed-copy", targetPath: "/workspace/.agents/skills/alpha", metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/alpha", targetHash: "preserved" } },
+          { name: "external", kind: "external", targetPath: "/workspace/.agents/skills/external" },
+        ] };
+      },
+      async renameManagedCopy(input) { calls.push(["rename", input]); return { ok: true, targetPath: "/workspace/.agents/skills/beta" }; },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls[1], ["rename", {
+    oldTargetPath: "/workspace/.agents/skills/alpha", targetRootPath: "/workspace/.agents/skills", skillName: "beta",
+    metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/beta", targetHash: "preserved" },
+  }]);
 });

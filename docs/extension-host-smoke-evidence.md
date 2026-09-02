@@ -124,6 +124,14 @@ Screenshot은 private path, secret, token, user file content를 노출하지 않
 - 미확인 항목: multi-client aggregate AI icon, 우클릭 Global enrollment apply/remove, cleanup/source-only의 실제 host refresh, Codex 새 session 재탐색.
 - 후속: 접근 가능한 Extension Development Host에서 `docs/release-smoke.md` §6의 새 항목을 실행하고 이 절을 `completed`/`pass`로 갱신한다.
 
+## 9. Source integrity UI 재확인 (2026-09-02)
+
+- 상태: partial
+- 확인 범위: 실제 Extension Development Host에서 Sponzey Skills Activity Bar를 열고 Main Repository, Global Skills, Project Skills, Diagnostics tree를 확인했다.
+- 관찰 결과: Main Repository는 source-only 목록과 applied/inactive 상태를 표시했고, Diagnostics는 stale analysis metadata 10건을 원인 및 `Analyze All Skills` 다음 행동과 함께 표시했다.
+- Refresh: Global Skills toolbar의 `Sponzey Skills: Refresh Skills`를 실행한 뒤 네 tree가 유지되고 Diagnostics group이 다시 표시됐다.
+- 미실행: missing-`SKILL.md` import, valid import, rename, target placement mutation. 실제 사용자 Main Repository를 변경하지 않기 위해 별도의 격리 repository 전환과 사용자 승인 후 수행한다.
+
 허용 판단 값:
 
 - ready

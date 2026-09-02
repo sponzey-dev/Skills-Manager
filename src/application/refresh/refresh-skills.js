@@ -72,9 +72,7 @@ export async function refreshSkills({
   if (analysisMetadataResult.available) {
     steps.push("LoadingAnalysisMetadata");
   }
-  const sourceByPath = new Map(
-    indexedSources.map((source) => [normalizePath(source.sourcePath), source]),
-  );
+  const sourceByPath = sourceLookupByCurrentAndAliasPath({ sources: indexedSources, repositoryIndexResult });
   const mainRepositorySkills = indexedSources.map((source) =>
     mapSourceToMainRepositorySkill({
       source,
@@ -95,6 +93,7 @@ export async function refreshSkills({
   const globalSkills = [];
   const projectSkills = [];
   const diagnostics = [
+    ...(sourceResult.diagnostics ?? []),
     ...repositoryIndexResult.diagnostics,
     ...repositoryVersionResult.diagnostics,
     ...analysisMetadataResult.diagnostics,
@@ -140,6 +139,7 @@ export async function refreshSkills({
           ...diagnostic,
           targetId: target.id,
           targetPath: normalizePath(target.targetPath),
+          targetSkillPath: result.skill.targetPath,
         })),
       ),
     );
@@ -803,9 +803,10 @@ async function mapAppliedSkill({
   sourceHashByPath,
   hashPort,
 }) {
+  const diagnostics = [];
   const sourcePath = sourcePathForAppliedSkill(appliedSkill);
   const source = sourcePath ? sourceByPath.get(normalizePath(sourcePath)) : null;
-  const sourceId = source?.id ?? null;
+  const sourceId = source?.id ?? appliedSkill.metadata?.sourceSkillId ?? null;
   const syncEnabled = typeof hashPort?.hashDirectory === "function";
   const normalizedSourcePath = sourcePath ? normalizePath(sourcePath) : null;
   const currentSourceHash = normalizedSourcePath
@@ -834,7 +835,35 @@ async function mapAppliedSkill({
       }
       mainSkill.status = "applied";
       mainSkill.appliedTargets.push(appliedTarget);
+      if (
+        appliedSkill.name !== mainSkill.name &&
+        appliedSkill.metadata?.sourceSkillId === sourceId
+      ) {
+        diagnostics.push({
+          code: "managed-skill-name-out-of-sync",
+          severity: "warning",
+          category: "sync",
+          message: "Managed skill name does not match its Main Repository source.",
+          recommendation: "Use Rename Source Skill synchronization after reviewing the managed placement.",
+          sourceId,
+          skillName: mainSkill.name,
+          allowedActions: [{
+            code: "synchronize-managed-skill-name",
+            requiresConfirmation: true,
+            mutatesTarget: true,
+          }],
+        });
+      }
     }
+  }
+
+  if (appliedSkill.kind === "broken-symlink" && source && appliedSkill.name !== source.name) {
+    diagnostics.push({
+      code: "managed-skill-name-out-of-sync", severity: "warning", category: "sync",
+      message: "Broken managed skill symlink still points to a previous source path.",
+      recommendation: "Rename or recreate the managed symlink after reviewing the target.",
+      sourceId: source.id, skillName: source.name,
+    });
   }
 
   const mapped = {
@@ -865,7 +894,10 @@ async function mapAppliedSkill({
 
   return {
     skill: mapped,
-    diagnostics: externalContentHash.diagnostic ? [externalContentHash.diagnostic] : [],
+    diagnostics: [
+      ...diagnostics,
+      ...(externalContentHash.diagnostic ? [externalContentHash.diagnostic] : []),
+    ],
   };
 }
 
@@ -941,7 +973,22 @@ function sourcePathForAppliedSkill(appliedSkill) {
     return appliedSkill.metadata.sourcePath;
   }
 
+  if (appliedSkill.kind === "broken-symlink" && appliedSkill.linkTargetPath) {
+    return appliedSkill.linkTargetPath;
+  }
+
   return null;
+}
+
+function sourceLookupByCurrentAndAliasPath({ sources, repositoryIndexResult }) {
+  const sourceByPath = new Map(sources.map((source) => [normalizePath(source.sourcePath), source]));
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  for (const entry of repositoryIndexResult.entryByPath.values()) {
+    const source = sourceById.get(entry.sourceId);
+    if (!source) continue;
+    for (const aliasPath of entry.previousSourcePaths ?? []) sourceByPath.set(normalizePath(aliasPath), source);
+  }
+  return sourceByPath;
 }
 
 function appliedStatus({ appliedSkill, sourceId }) {

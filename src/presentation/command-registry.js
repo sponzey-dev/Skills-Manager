@@ -34,6 +34,7 @@ export const SPONZEY_COMMANDS = Object.freeze([
   command("sponzeySkills.backupAppliedSkillToMainRepository", "Sponzey Skills: Backup Applied Skill to Main Repository"),
   command("sponzeySkills.moveAppliedSkillToMainRepository", "Sponzey Skills: Move Applied Skill to Main Repository"),
   command("sponzeySkills.renameSourceSkill", "Sponzey Skills: Rename Source Skill"),
+  command("sponzeySkills.synchronizeManagedSkillName", "Sponzey Skills: Synchronize Managed Skill Name"),
   command("sponzeySkills.deleteSourceSkill", "Sponzey Skills: Delete Source Skill"),
   command("sponzeySkills.exportSourceSkill", "Sponzey Skills: Export Source Skill"),
   command("sponzeySkills.importSkillArchive", "Sponzey Skills: Import Skill Archive"),
@@ -104,6 +105,7 @@ const USE_CASE_BY_COMMAND_ID = Object.freeze({
   "sponzeySkills.moveAppliedSkillToMainRepository":
     "moveAppliedSkillToMainRepository",
   "sponzeySkills.renameSourceSkill": "renameSourceSkill",
+  "sponzeySkills.synchronizeManagedSkillName": "synchronizeManagedSkillName",
   "sponzeySkills.deleteSourceSkill": "deleteSourceSkill",
   "sponzeySkills.exportSourceSkill": "exportSourceSkill",
   "sponzeySkills.importSkillArchive": "importSkillArchiveToMainRepository",

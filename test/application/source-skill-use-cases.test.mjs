@@ -697,3 +697,40 @@ test("installSkillToMainRepository cleans resolved source after import conflict"
     "CleanupInstallSource",
   ]);
 });
+
+test("importSkillToMainRepository stops before analysis when source verification fails", async () => {
+  let analyzeCalled = false;
+  const result = await importSkillToMainRepository({
+    context: { mainRepositoryPath: "/repo" },
+    input: {
+      externalSourcePath: "/external/missing-manifest",
+      name: "missing-manifest",
+      runAnalysisAfterImport: true,
+    },
+    skillRepository: {
+      async importSourceSkill() {
+        return {
+          ok: false,
+          error: {
+            code: "source-skill-md-missing",
+            severity: "error",
+            message: "Source skill must contain SKILL.md at its root.",
+            recommendation: "Choose a skill folder that contains SKILL.md at its root.",
+          },
+        };
+      },
+    },
+    analyzer: {
+      async analyzeImportedSkill() {
+        analyzeCalled = true;
+        return { riskLevel: "low", diagnostics: [] };
+      },
+    },
+  });
+
+  assert.equal(analyzeCalled, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0].code, "source-skill-md-missing");
+  assert.equal(result.steps.at(-1), "VerificationFailed");
+  assert.equal(result.events[0].code, "skill.import.failed");
+});

@@ -645,6 +645,7 @@ export function buildRepositoryIndex({
       sourcePath,
       sourceHash,
       origin: existingEntry?.origin ?? source.origin ?? "scanned",
+      previousSourcePaths: nonEmptyPreviousSourcePaths(existingEntry?.previousSourcePaths),
       indexStatus: "indexed",
       indexedAt: nextIndexedAt,
     });
@@ -658,6 +659,13 @@ export function buildRepositoryIndex({
     },
     entries,
   };
+}
+
+function nonEmptyPreviousSourcePaths(paths) {
+  const normalized = Array.isArray(paths)
+    ? [...new Set(paths.filter(hasText).map(normalizePath))]
+    : [];
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 export function repositoryIndexUnsupportedVersionDiagnostic() {

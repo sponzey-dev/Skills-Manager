@@ -604,19 +604,279 @@ export async function convertAppliedSkillMode({ input, targetStore }) {
   };
 }
 
-export async function renameSourceSkill({ context, input, skillRepository }) {
-  return repositoryMutation({
-    eventCode: "skill.source.rename.completed",
-    unavailableCode: "source-rename-unavailable",
-    methodName: "renameSourceSkill",
-    skillRepository,
-    input: {
-      repositoryPath: context.mainRepositoryPath,
-      oldName: input?.oldName ?? input?.source?.name,
-      newName: input?.newName,
-    },
-    steps: ["ValidatingInput", "RenamingSource"],
+export async function renameSourceSkill({
+  context,
+  input,
+  skillRepository,
+  repositoryIndexStore = null,
+  hashPort = null,
+  targetStore = null,
+}) {
+  const repositoryPath = context.mainRepositoryPath;
+  const oldName = input?.oldName ?? input?.source?.name;
+  const newName = input?.newName;
+  const steps = ["ValidatingInput"];
+  let existingIndex = null;
+  const managedSymlinks = await findManagedSymlinksForRename({ context, input, targetStore });
+  if (!managedSymlinks.ok) return managedSymlinks.result;
+  const modifiedCopies = managedSymlinks.placements.filter(({ appliedSkill }) => appliedSkill.kind === "managed-copy" && copyRequiresConfirmation(appliedSkill));
+  if (modifiedCopies.length > 0 && input?.modifiedCopyConfirmed !== true) {
+    return {
+      ok: false, additionalInputRequired: true,
+      diagnostics: [confirmationRequiredDiagnostic({ code: "rename-modified-copy-confirmation-required", operation: "rename-source-skill", confirmationKey: "modifiedCopyConfirmed", message: "Renaming modified managed copies requires explicit confirmation." })],
+      events: [{ level: "ProductLog", code: "skill.source.rename.blocked", reason: "rename-modified-copy-confirmation-required" }],
+      steps: ["ValidatingInput", "ScanningManagedTargets", "ModifiedCopyConfirmationRequired"],
+    };
+  }
+
+  if (typeof skillRepository?.renameSourceSkill !== "function") {
+    return failure("skill.source.rename.failed", {
+      code: "source-rename-unavailable", severity: "error", message: "Source rename is unavailable.",
+    }, [...steps, "RepositoryOperationUnavailable"]);
+  }
+
+  if (typeof repositoryIndexStore?.readRepositoryIndex === "function") {
+    steps.push("ReadingRepositoryIndex");
+    const readResult = await repositoryIndexStore.readRepositoryIndex({ repositoryPath });
+    if (!readResult.ok) return failure("skill.source.rename.failed", readResult.error, [...steps, "IndexReadFailed"]);
+    existingIndex = readResult.index;
+  }
+
+  steps.push("RenamingSource");
+  const renameResult = await skillRepository.renameSourceSkill({ repositoryPath, oldName, newName });
+  if (!renameResult.ok) return failure("skill.source.rename.failed", renameResult.error, [...steps, "RenameFailed"]);
+
+  const sourceId = input?.source?.id ?? renameResult.source.id;
+  let sourceHash = null;
+  if (typeof hashPort?.hashDirectory === "function") {
+    steps.push("HashingSource");
+    const hashResult = await hashPort.hashDirectory({ directoryPath: renameResult.source.sourcePath });
+    if (!hashResult.ok) return rollbackRenamedSource({ skillRepository, repositoryPath, oldName, newName, failureDiagnostic: hashResult.error, steps: [...steps, "HashFailed"] });
+    sourceHash = hashResult.hash;
+  }
+
+  if (typeof repositoryIndexStore?.writeRepositoryIndex === "function") {
+    steps.push("WritingRepositoryIndex");
+    const index = renamedRepositoryIndex({ existingIndex, sourceId, oldName, oldSourcePath: input?.source?.sourcePath, renamedSource: renameResult.source, sourceHash });
+    const writeResult = await repositoryIndexStore.writeRepositoryIndex({ repositoryPath, index });
+    if (!writeResult.ok) return rollbackRenamedSource({ skillRepository, repositoryPath, oldName, newName, failureDiagnostic: writeResult.error, steps: [...steps, "IndexWriteFailed"] });
+  }
+
+  const updatedPlacements = [];
+  for (const placement of managedSymlinks.placements) {
+    const targetResult = placement.appliedSkill.kind === "managed-copy"
+      ? await targetStore.renameManagedCopy({ oldTargetPath: placement.appliedSkill.targetPath, targetRootPath: placement.target.targetPath, skillName: newName, metadata: { ...placement.appliedSkill.metadata, sourceSkillId: sourceId, sourcePath: renameResult.source.sourcePath } })
+      : await targetStore.renameManagedSymlink({ oldTargetPath: placement.appliedSkill.targetPath, targetRootPath: placement.target.targetPath, skillName: newName, sourcePath: renameResult.source.sourcePath });
+    if (!targetResult.ok) {
+      return rollbackRenameAfterTargetFailure({
+        skillRepository,
+        repositoryIndexStore,
+        repositoryPath,
+        oldName,
+        newName,
+        originalIndex: existingIndex,
+        targetStore,
+        updatedPlacements,
+        oldSourcePath: input?.source?.sourcePath,
+        failureDiagnostic: targetResult.error,
+        steps: [...steps, "UpdatingManagedTargets", "TargetUpdateFailed"],
+      });
+    }
+    updatedPlacements.push({ placement, renamedTargetPath: targetResult.targetPath });
+  }
+
+  return {
+    ok: true,
+    source: { ...renameResult.source, id: sourceId },
+    diagnostics: [],
+    events: [{ level: "ProductLog", code: "skill.source.rename.completed", sourceId }],
+    steps: [...steps, "Completed"],
+  };
+}
+
+export async function synchronizeManagedSkillName({ context, input, targetStore }) {
+  const source = input?.source;
+  const diagnostic = input?.diagnostic;
+  if (
+    input?.confirmationProvided !== true ||
+    !source?.id || !source?.name || !source?.sourcePath ||
+    diagnostic?.code !== "managed-skill-name-out-of-sync" ||
+    diagnostic.sourceId !== source.id ||
+    !diagnostic.targetPath || !diagnostic.targetSkillPath
+  ) {
+    return failure("skill.managed-name-sync.failed", {
+      code: "managed-name-sync-input-invalid", severity: "error",
+      message: "A confirmed, exact managed placement and source are required.",
+    }, ["ValidatingInput", "ValidationFailed"]);
+  }
+  if (typeof targetStore?.scanAppliedSkills !== "function" || typeof targetStore?.renameManagedCopy !== "function") {
+    return failure("skill.managed-name-sync.failed", {
+      code: "managed-name-sync-unavailable", severity: "error",
+      message: "Managed placement synchronization is unavailable.",
+    }, ["ValidatingInput", "TargetStoreUnavailable"]);
+  }
+  const scanResult = await targetStore.scanAppliedSkills({ targetPath: diagnostic.targetPath, knownSourcePaths: [source.sourcePath] });
+  if (!scanResult.ok) return failure("skill.managed-name-sync.failed", scanResult.error, ["ValidatingInput", "ScanningTarget", "TargetScanFailed"]);
+  const appliedSkill = (scanResult.appliedSkills ?? []).find((entry) =>
+    entry.kind === "managed-copy" &&
+    entry.targetPath === diagnostic.targetSkillPath &&
+    entry.metadata?.sourceSkillId === source.id,
+  );
+  if (!appliedSkill) return failure("skill.managed-name-sync.failed", {
+    code: "managed-name-sync-placement-not-found", severity: "warning",
+    message: "The managed placement is no longer available for synchronization.",
+  }, ["ValidatingInput", "ScanningTarget", "PlacementNotFound"]);
+
+  const renameResult = await targetStore.renameManagedCopy({
+    oldTargetPath: appliedSkill.targetPath,
+    targetRootPath: diagnostic.targetPath,
+    skillName: source.name,
+    metadata: { ...appliedSkill.metadata, sourceSkillId: source.id, sourcePath: source.sourcePath },
   });
+  if (!renameResult.ok) return failure("skill.managed-name-sync.failed", renameResult.error, ["ValidatingInput", "ScanningTarget", "SynchronizingPlacement", "SyncFailed"]);
+  return {
+    ok: true,
+    targetPath: renameResult.targetPath,
+    diagnostics: [],
+    events: [{ level: "ProductLog", code: "skill.managed-name-sync.completed", sourceId: source.id }],
+    steps: ["ValidatingInput", "ScanningTarget", "SynchronizingPlacement", "Completed"],
+  };
+}
+
+async function findManagedSymlinksForRename({ context, input, targetStore }) {
+  if (typeof targetStore?.scanAppliedSkills !== "function") return { ok: true, placements: [] };
+  const sourcePath = input?.source?.sourcePath;
+  const sourceId = input?.source?.id;
+  const placements = [];
+  for (const target of [...(context.globalTargets ?? []), ...(context.projectTargets ?? [])]) {
+    const result = await targetStore.scanAppliedSkills({ targetPath: target.targetPath, knownSourcePaths: sourcePath ? [sourcePath] : [] });
+    if (!result.ok) return { ok: false, result: failure("skill.source.rename.failed", result.error, ["ValidatingInput", "ScanningManagedTargets", "TargetScanFailed"]) };
+    for (const appliedSkill of result.appliedSkills ?? []) {
+      if (appliedSkill.kind !== "managed-symlink" && appliedSkill.kind !== "managed-copy") continue;
+      const managedSourceId = appliedSkill.sourceId ?? appliedSkill.metadata?.sourceSkillId;
+      const managedSourcePath = appliedSkill.sourcePath ?? appliedSkill.metadata?.sourcePath;
+      const identityMatches = managedSourcePath === sourcePath || managedSourceId === sourceId;
+      if (!identityMatches) continue;
+      if (managedSourceId === sourceId && managedSourcePath && managedSourcePath !== sourcePath) {
+        return {
+          ok: false,
+          result: failure("skill.source.rename.failed", {
+            code: "managed-placement-identity-ambiguous",
+            severity: "error",
+            message: "Managed placement identity does not match its source path.",
+          }, ["ValidatingInput", "ScanningManagedTargets", "AmbiguousIdentity"]),
+        };
+      }
+      placements.push({ target, appliedSkill });
+    }
+  }
+  return { ok: true, placements };
+}
+
+function copyRequiresConfirmation(appliedSkill) {
+  const metadata = appliedSkill.metadata ?? {};
+  return !metadata.sourceHash || !metadata.targetHash || metadata.sourceHash !== metadata.targetHash;
+}
+
+function renamedRepositoryIndex({ existingIndex, sourceId, oldName, oldSourcePath, renamedSource, sourceHash }) {
+  const priorSources = existingIndex?.sources ?? [];
+  const matching = priorSources.find((entry) => entry.sourceId === sourceId || entry.sourceName === oldName);
+  const indexedAt = matching?.indexedAt ?? existingIndex?.indexedAt ?? new Date(0).toISOString();
+  const nextEntry = {
+    ...matching,
+    sourceId,
+    sourceName: renamedSource.name,
+    sourcePath: renamedSource.sourcePath,
+    sourceHash: sourceHash ?? matching?.sourceHash,
+    previousSourcePaths: [...new Set([
+      ...(matching?.previousSourcePaths ?? []),
+      matching?.sourcePath ?? oldSourcePath,
+    ])],
+    indexStatus: sourceHash ? "indexed" : "stale",
+    indexedAt,
+  };
+  return {
+    schemaVersion: existingIndex?.schemaVersion ?? 1,
+    indexedAt: existingIndex?.indexedAt ?? indexedAt,
+    sources: [...priorSources.filter((entry) => entry !== matching), nextEntry],
+  };
+}
+
+async function rollbackRenamedSource({ skillRepository, repositoryPath, oldName, newName, failureDiagnostic, steps }) {
+  const rollbackResult = await skillRepository.renameSourceSkill({ repositoryPath, oldName: newName, newName: oldName });
+  if (!rollbackResult.ok) {
+    return {
+      ok: false, recoveryRequired: true, diagnostics: [failureDiagnostic, rollbackResult.error],
+      events: [{ level: "ProductLog", code: "skill.source.rename.recovery-required", reason: failureDiagnostic?.code }],
+      steps: [...steps, "RollingBack", "RecoveryRequired"],
+    };
+  }
+  return failure("skill.source.rename.failed", failureDiagnostic, [...steps, "RollingBack", "RolledBack"]);
+}
+
+async function rollbackRenameAfterTargetFailure({
+  skillRepository,
+  repositoryIndexStore,
+  repositoryPath,
+  oldName,
+  newName,
+  originalIndex,
+  targetStore,
+  updatedPlacements,
+  oldSourcePath,
+  failureDiagnostic,
+  steps,
+}) {
+  const rollbackErrors = [];
+  for (const { placement, renamedTargetPath } of [...updatedPlacements].reverse()) {
+    const appliedSkill = placement.appliedSkill;
+    const result = appliedSkill.kind === "managed-copy"
+      ? await targetStore.renameManagedCopy({
+        oldTargetPath: renamedTargetPath,
+        targetRootPath: placement.target.targetPath,
+        skillName: appliedSkill.name,
+        metadata: appliedSkill.metadata,
+      })
+      : await targetStore.renameManagedSymlink({
+        oldTargetPath: renamedTargetPath,
+        newTargetPath: appliedSkill.targetPath,
+        targetRootPath: placement.target.targetPath,
+        skillName: appliedSkill.name,
+        sourcePath: oldSourcePath,
+      });
+    if (!result.ok) rollbackErrors.push(result.error);
+  }
+
+  const sourceRollback = await skillRepository.renameSourceSkill({
+    repositoryPath,
+    oldName: newName,
+    newName: oldName,
+  });
+  if (!sourceRollback.ok) rollbackErrors.push(sourceRollback.error);
+
+  if (originalIndex && typeof repositoryIndexStore?.writeRepositoryIndex === "function") {
+    const indexRollback = await repositoryIndexStore.writeRepositoryIndex({
+      repositoryPath,
+      index: originalIndex,
+    });
+    if (!indexRollback.ok) rollbackErrors.push(indexRollback.error);
+  }
+
+  if (rollbackErrors.length > 0) {
+    return {
+      ok: false,
+      recoveryRequired: true,
+      diagnostics: [failureDiagnostic, ...rollbackErrors],
+      events: [{ level: "ProductLog", code: "skill.source.rename.recovery-required", reason: failureDiagnostic?.code }],
+      steps: [...steps, "RollingBack", "RecoveryRequired"],
+    };
+  }
+
+  return failure("skill.source.rename.failed", failureDiagnostic, [
+    ...steps,
+    "RollingBack",
+    "RolledBack",
+  ]);
 }
 
 export async function deleteSourceSkill({

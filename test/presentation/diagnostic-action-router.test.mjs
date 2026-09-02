@@ -160,6 +160,35 @@ test("resolveDiagnosticActionCommand routes confirmed mutating actions to existi
   );
 });
 
+test("resolveDiagnosticActionCommand routes a confirmed managed-name synchronization only to its diagnostic placement", () => {
+  const item = diagnosticItem({
+    allowedActionCodes: ["synchronize-managed-skill-name"],
+    confirmationRequiredActionCodes: ["synchronize-managed-skill-name"],
+  });
+  item.diagnostic = {
+    ...item.diagnostic,
+    code: "managed-skill-name-out-of-sync",
+    sourceId: "stable",
+    targetId: "project:open",
+    targetPath: "/workspace/.agents/skills",
+    targetSkillPath: "/workspace/.agents/skills/alpha",
+  };
+
+  assert.deepEqual(resolveDiagnosticActionCommand({
+    item,
+    actionCode: "synchronize-managed-skill-name",
+    confirmationProvided: true,
+  }), {
+    ok: true,
+    commandId: "sponzeySkills.synchronizeManagedSkillName",
+    input: {
+      source: item.source,
+      diagnostic: item.diagnostic,
+      confirmationProvided: true,
+    },
+  });
+});
+
 test("resolveDiagnosticActionCommand routes backup compare diagnostics to compare command", () => {
   const item = diagnosticItem({
     allowedActionCodes: ["compare-backup"],

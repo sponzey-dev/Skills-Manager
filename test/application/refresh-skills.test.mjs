@@ -197,6 +197,74 @@ test("refreshSkills marks main repository sources inactive before explicit apply
   ]);
 });
 
+test("refreshSkills reports an out-of-sync managed placement after a project is reopened", async () => {
+  const result = await refreshSkills({
+    context: {
+      mainRepositoryPath: "/repo",
+      globalTargets: [],
+      projectTargets: [{ id: "project:open", clientType: "codex", scope: "project", targetPath: "/workspace/.agents/skills" }],
+    },
+    skillRepository: {
+      async scanSourceSkills() {
+        return { ok: true, sources: [{ id: "stable", name: "beta", sourcePath: "/repo/skills/beta" }] };
+      },
+    },
+    targetStore: {
+      async scanAppliedSkills() {
+        return {
+          ok: true,
+          diagnostics: [],
+          appliedSkills: [{
+            name: "alpha",
+            kind: "managed-copy",
+            targetPath: "/workspace/.agents/skills/alpha",
+            metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/alpha" },
+          }],
+        };
+      },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.readModel.diagnostics.filter((diagnostic) => diagnostic.code === "managed-skill-name-out-of-sync"), [{
+    code: "managed-skill-name-out-of-sync",
+    severity: "warning",
+    category: "sync",
+    message: "Managed skill name does not match its Main Repository source.",
+    recommendation: "Use Rename Source Skill synchronization after reviewing the managed placement.",
+    sourceId: "stable",
+    skillName: "beta",
+    allowedActions: [{
+      code: "synchronize-managed-skill-name",
+      requiresConfirmation: true,
+      mutatesTarget: true,
+    }],
+    targetId: "project:open",
+    targetPath: "/workspace/.agents/skills",
+    targetSkillPath: "/workspace/.agents/skills/alpha",
+  }]);
+});
+
+test("refreshSkills identifies only a broken symlink that points to a stored source-path alias", async () => {
+  const result = await refreshSkills({
+    context: { mainRepositoryPath: "/repo", globalTargets: [], projectTargets: [{ id: "project:open", scope: "project", targetPath: "/workspace/.agents/skills" }] },
+    skillRepository: { async scanSourceSkills() { return { ok: true, sources: [{ id: "stable", name: "beta", sourcePath: "/repo/skills/beta" }] }; } },
+    repositoryIndexStore: {
+      async readRepositoryIndex() { return { ok: true, index: { schemaVersion: 1, indexedAt: "2026-09-01T00:00:00.000Z", sources: [{ sourceId: "stable", sourceName: "beta", sourcePath: "/repo/skills/beta", previousSourcePaths: ["/repo/skills/alpha"], indexStatus: "indexed", indexedAt: "2026-09-01T00:00:00.000Z" }] } }; },
+      async writeRepositoryIndex() { return { ok: true }; },
+    },
+    targetStore: { async scanAppliedSkills() { return { ok: true, diagnostics: [], appliedSkills: [
+      { name: "alpha", kind: "broken-symlink", targetPath: "/workspace/.agents/skills/alpha", linkTargetPath: "/repo/skills/alpha" },
+      { name: "external", kind: "broken-symlink", targetPath: "/workspace/.agents/skills/external", linkTargetPath: "/elsewhere/alpha" },
+    ] }; } },
+  });
+
+  const aliasDiagnostics = result.readModel.diagnostics.filter((item) => item.code === "managed-skill-name-out-of-sync");
+  assert.equal(aliasDiagnostics.length, 1);
+  assert.equal(aliasDiagnostics[0].sourceId, "stable");
+  assert.equal(aliasDiagnostics[0].targetSkillPath, "/workspace/.agents/skills/alpha");
+});
+
 test("refreshSkills includes backup catalog when repository exposes backup scan", async () => {
   const result = await refreshSkills({
     context: {
@@ -1203,6 +1271,49 @@ test("refreshSkills keeps duplicate same-client target skills and reports their 
     ),
     true,
   );
+});
+
+test("refreshSkills includes source scan diagnostics while retaining valid source rows", async () => {
+  const result = await refreshSkills({
+    context: {
+      mainRepositoryPath: "/repo",
+      globalTargets: [],
+      projectTargets: [],
+    },
+    skillRepository: {
+      async scanSourceSkills() {
+        return {
+          ok: true,
+          sources: [source("valid", "/repo/skills/valid")],
+          diagnostics: [
+            {
+              code: "source-skill-md-missing",
+              severity: "warning",
+              message: "Source skill folder is missing SKILL.md.",
+              recommendation: "Add SKILL.md at the root or remove the invalid source folder.",
+              skillName: "missing-manifest",
+            },
+          ],
+        };
+      },
+    },
+    targetStore: failIfCalledTargetStore(),
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.readModel.mainRepositorySkills.map((skill) => skill.name),
+    ["valid"],
+  );
+  assert.deepEqual(result.readModel.diagnostics, [
+    {
+      code: "source-skill-md-missing",
+      severity: "warning",
+      message: "Source skill folder is missing SKILL.md.",
+      recommendation: "Add SKILL.md at the root or remove the invalid source folder.",
+      skillName: "missing-manifest",
+    },
+  ]);
 });
 
 function source(name, sourcePath) {

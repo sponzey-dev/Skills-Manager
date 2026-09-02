@@ -32,6 +32,7 @@ export async function createSkill({ context, input, skillRepository }) {
     return sourceCreateFailed({
       diagnostics: [createResult.error],
       steps: [...steps, failureStepForRepositoryError(createResult.error)],
+      recoveryRequired: createResult.recoveryRequired,
     });
   }
 
@@ -90,6 +91,7 @@ export async function importSkillToMainRepository({
     return sourceImportFailed({
       diagnostics: [importResult.error],
       steps: [...steps, failureStepForRepositoryError(importResult.error)],
+      recoveryRequired: importResult.recoveryRequired,
     });
   }
 
@@ -206,6 +208,7 @@ export async function installSkillToMainRepository({
     return sourceInstallFailed({
       diagnostics: [importResult.error],
       steps,
+      recoveryRequired: importResult.recoveryRequired,
     });
   }
 
@@ -371,8 +374,8 @@ async function installDiscoveredSkillsToMainRepository({
   };
 }
 
-function sourceCreateFailed({ diagnostics, steps }) {
-  return {
+function sourceCreateFailed({ diagnostics, steps, recoveryRequired = false }) {
+  const result = {
     ok: false,
     source: null,
     diagnostics,
@@ -385,10 +388,12 @@ function sourceCreateFailed({ diagnostics, steps }) {
     ],
     steps,
   };
+  if (recoveryRequired) result.recoveryRequired = true;
+  return result;
 }
 
-function sourceImportFailed({ diagnostics, steps }) {
-  return {
+function sourceImportFailed({ diagnostics, steps, recoveryRequired = false }) {
+  const result = {
     ok: false,
     source: null,
     analysis: null,
@@ -402,10 +407,12 @@ function sourceImportFailed({ diagnostics, steps }) {
     ],
     steps,
   };
+  if (recoveryRequired) result.recoveryRequired = true;
+  return result;
 }
 
-function sourceInstallFailed({ diagnostics, steps }) {
-  return {
+function sourceInstallFailed({ diagnostics, steps, recoveryRequired = false }) {
+  const result = {
     ok: false,
     source: null,
     analysis: null,
@@ -419,6 +426,8 @@ function sourceInstallFailed({ diagnostics, steps }) {
     ],
     steps,
   };
+  if (recoveryRequired) result.recoveryRequired = true;
+  return result;
 }
 
 async function cleanupInstallSource({ resolvedSource, steps }) {
@@ -462,6 +471,14 @@ function hasText(value) {
 function failureStepForRepositoryError(error) {
   if (error?.code === "source-name-conflict") {
     return "NameConflictBlocked";
+  }
+
+  if (typeof error?.code === "string" && error.code.startsWith("source-skill-md-")) {
+    return "VerificationFailed";
+  }
+
+  if (error?.code === "source-cleanup-failed") {
+    return "RecoveryRequired";
   }
 
   return "WriteFailed";

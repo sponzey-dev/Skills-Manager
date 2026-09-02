@@ -4,8 +4,10 @@ import {
   lstat,
   mkdir,
   readFile,
+  readlink,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   unlink,
@@ -26,6 +28,15 @@ export class FileSystemTargetStore {
       readFile: fileSystem.readFile ?? readFile,
       readdir: fileSystem.readdir ?? readdir,
       realpath: fileSystem.realpath ?? realpath,
+      readlink: fileSystem.readlink ?? readlink,
+    };
+    this.mutationFileSystem = {
+      lstat: fileSystem.lstat ?? lstat,
+      readFile: fileSystem.readFile ?? readFile,
+      rename: fileSystem.rename ?? rename,
+      symlink: fileSystem.symlink ?? symlink,
+      unlink: fileSystem.unlink ?? unlink,
+      writeFile: fileSystem.writeFile ?? writeFile,
     };
   }
 
@@ -194,6 +205,90 @@ export class FileSystemTargetStore {
     }, "remove-target-entry");
   }
 
+  async renameManagedSymlink({ oldTargetPath, newTargetPath, targetRootPath, skillName, sourcePath }) {
+    const destinationResult = newTargetPath
+      ? { ok: true, targetPath: newTargetPath }
+      : resolveTargetDestination({ targetRootPath, skillName });
+    if (!destinationResult.ok) return destinationResult;
+    newTargetPath = destinationResult.targetPath;
+    if (await canAccess(newTargetPath)) {
+      return {
+        ok: false,
+        error: {
+          code: "target-overwrite-rejected",
+          severity: "error",
+          message: "Target destination already exists.",
+        },
+      };
+    }
+
+    return withFileSystemResult(async () => {
+      const fileSystem = this.mutationFileSystem;
+      const stats = await fileSystem.lstat(oldTargetPath);
+      if (!stats.isSymbolicLink()) {
+        return {
+          ok: false,
+          error: {
+            code: "managed-symlink-required",
+            severity: "error",
+            message: "Managed target rename requires a symbolic link.",
+          },
+        };
+      }
+      await fileSystem.symlink(sourcePath, newTargetPath, "dir");
+      try {
+        await fileSystem.unlink(oldTargetPath);
+      } catch (error) {
+        try {
+          await fileSystem.unlink(newTargetPath);
+        } catch (rollbackError) {
+          return targetRenameRecoveryRequired(error, rollbackError);
+        }
+        return targetRenameRolledBack(error);
+      }
+      return {
+        ok: true,
+        targetPath: normalizePath(newTargetPath),
+        linkTargetPath: normalizePath(sourcePath),
+      };
+    }, "rename-managed-symlink");
+  }
+
+  async renameManagedCopy({ oldTargetPath, targetRootPath, skillName, metadata }) {
+    const destinationResult = resolveTargetDestination({ targetRootPath, skillName });
+    if (!destinationResult.ok) return destinationResult;
+    const newTargetPath = destinationResult.targetPath;
+    if (await canAccess(newTargetPath)) {
+      return { ok: false, error: { code: "target-overwrite-rejected", severity: "error", message: "Target destination already exists." } };
+    }
+    return withFileSystemResult(async () => {
+      const fileSystem = this.mutationFileSystem;
+      const stats = await fileSystem.lstat(oldTargetPath);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) return { ok: false, error: { code: "managed-copy-required", severity: "error", message: "Managed target rename requires a copy directory." } };
+      const oldManifestPath = path.join(oldTargetPath, "SKILL.md");
+      const oldMetadataPath = path.join(oldTargetPath, APPLIED_METADATA_FILE);
+      const manifest = await fileSystem.readFile(oldManifestPath, "utf8");
+      const oldMetadata = await fileSystem.readFile(oldMetadataPath, "utf8");
+      const nextManifest = replaceTopLevelName(manifest, skillName);
+      if (nextManifest === null) return { ok: false, error: { code: "source-manifest-name-invalid", severity: "error", message: "Source SKILL.md must contain one editable top-level name field." } };
+      await fileSystem.rename(oldTargetPath, newTargetPath);
+      try {
+        await fileSystem.writeFile(path.join(newTargetPath, "SKILL.md"), nextManifest);
+        await fileSystem.writeFile(path.join(newTargetPath, APPLIED_METADATA_FILE), `${JSON.stringify(metadata, null, 2)}\n`);
+      } catch (error) {
+        try {
+          await fileSystem.rename(newTargetPath, oldTargetPath);
+          await fileSystem.writeFile(oldManifestPath, manifest);
+          await fileSystem.writeFile(oldMetadataPath, oldMetadata);
+        } catch (rollbackError) {
+          return targetRenameRecoveryRequired(error, rollbackError);
+        }
+        return targetRenameRolledBack(error);
+      }
+      return { ok: true, targetPath: normalizePath(newTargetPath), metadataPath: normalizePath(path.join(newTargetPath, APPLIED_METADATA_FILE)) };
+    }, "rename-managed-copy");
+  }
+
   async replaceCopyFromSource({ sourcePath, targetPath, metadata }) {
     return withFileSystemResult(async () => {
       await rm(targetPath, { recursive: true, force: false });
@@ -244,7 +339,7 @@ export class FileSystemTargetStore {
 
   async scanAppliedSkills({ targetPath, knownSourcePaths = [] }) {
     return withFileSystemResult(async () => {
-      const knownSourceSet = await createKnownSourceSet(
+      const knownSourcePathsByResolvedPath = await createKnownSourcePathsByResolvedPath(
         knownSourcePaths,
         this.scanFileSystem,
       );
@@ -278,7 +373,7 @@ export class FileSystemTargetStore {
           const skill = await classifySymlink({
             name: entry.name,
             entryPath,
-            knownSourceSet,
+            knownSourcePathsByResolvedPath,
             diagnostics,
             fileSystem: this.scanFileSystem,
           });
@@ -356,24 +451,28 @@ function targetPathTraversalRejected() {
   };
 }
 
-async function createKnownSourceSet(knownSourcePaths, fileSystem) {
-  const knownSourceSet = new Set();
+async function createKnownSourcePathsByResolvedPath(knownSourcePaths, fileSystem) {
+  const knownSourcePathsByResolvedPath = new Map();
 
   for (const sourcePath of knownSourcePaths) {
+    const normalizedSourcePath = normalizePath(sourcePath);
     try {
-      knownSourceSet.add(normalizePath(await fileSystem.realpath(sourcePath)));
+      knownSourcePathsByResolvedPath.set(
+        normalizePath(await fileSystem.realpath(sourcePath)),
+        normalizedSourcePath,
+      );
     } catch {
-      knownSourceSet.add(normalizePath(sourcePath));
+      knownSourcePathsByResolvedPath.set(normalizedSourcePath, normalizedSourcePath);
     }
   }
 
-  return knownSourceSet;
+  return knownSourcePathsByResolvedPath;
 }
 
 async function classifySymlink({
   name,
   entryPath,
-  knownSourceSet,
+  knownSourcePathsByResolvedPath,
   diagnostics,
   fileSystem,
 }) {
@@ -382,6 +481,7 @@ async function classifySymlink({
   try {
     resolvedPath = normalizePath(await fileSystem.realpath(entryPath));
   } catch {
+    const linkTargetPath = await readLinkTargetPath({ entryPath, fileSystem });
     diagnostics.push({
       code: "broken-symlink",
       severity: "warning",
@@ -394,6 +494,7 @@ async function classifySymlink({
       name,
       kind: "broken-symlink",
       targetPath: normalizePath(entryPath),
+      ...(linkTargetPath ? { linkTargetPath } : {}),
     };
   }
 
@@ -408,12 +509,13 @@ async function classifySymlink({
     return null;
   }
 
-  if (knownSourceSet.has(resolvedPath)) {
+  const knownSourcePath = knownSourcePathsByResolvedPath.get(resolvedPath);
+  if (knownSourcePath) {
     return {
       name,
       kind: "managed-symlink",
       targetPath: normalizePath(entryPath),
-      sourcePath: resolvedPath,
+      sourcePath: knownSourcePath,
     };
   }
 
@@ -423,6 +525,15 @@ async function classifySymlink({
     targetPath: normalizePath(entryPath),
     sourcePath: resolvedPath,
   };
+}
+
+async function readLinkTargetPath({ entryPath, fileSystem }) {
+  try {
+    const target = await fileSystem.readlink(entryPath);
+    return normalizePath(path.resolve(path.dirname(entryPath), target));
+  } catch {
+    return null;
+  }
 }
 
 async function classifyDirectory({
@@ -507,6 +618,20 @@ async function canAccess(filePath, fileSystem = { access }) {
   }
 }
 
+function replaceTopLevelName(markdown, name) {
+  const opening = /^\uFEFF?---\r?\n/.exec(markdown);
+  if (!opening) return null;
+  const closing = /\r?\n---(?=\r?\n|$)/g;
+  closing.lastIndex = opening[0].length;
+  const end = closing.exec(markdown);
+  if (!end) return null;
+  const frontmatter = markdown.slice(opening[0].length, end.index);
+  const matches = [...frontmatter.matchAll(/^(name:[ \t]*)([^#\r\n]*?)([ \t]*(?:#.*)?)$/gm)];
+  if (matches.length !== 1 || matches[0][2].trim().length === 0) return null;
+  const start = opening[0].length + matches[0].index;
+  return markdown.slice(0, start) + `${matches[0][1]}${name}${matches[0][3]}` + markdown.slice(start + matches[0][0].length);
+}
+
 async function readOptionalDirectoryEntries(directoryPath, fileSystem) {
   try {
     return await fileSystem.readdir(directoryPath, { withFileTypes: true });
@@ -517,6 +642,32 @@ async function readOptionalDirectoryEntries(directoryPath, fileSystem) {
 
     throw error;
   }
+}
+
+function targetRenameRolledBack(error) {
+  return {
+    ok: false,
+    error: {
+      code: "target-rename-rolled-back",
+      severity: "error",
+      message: "Managed target rename failed and was rolled back.",
+      cause: error?.code,
+    },
+  };
+}
+
+function targetRenameRecoveryRequired(error, rollbackError) {
+  return {
+    ok: false,
+    recoveryRequired: true,
+    error: {
+      code: "target-rename-recovery-required",
+      severity: "error",
+      message: "Managed target rename failed and automatic recovery did not complete.",
+      cause: error?.code,
+      recoveryCause: rollbackError?.code,
+    },
+  };
 }
 
 async function withFileSystemResult(operation, operationName) {

@@ -88,6 +88,7 @@ test("scanAppliedSkills returns broken symlink diagnostic without throwing", asy
       name: "broken",
       kind: "broken-symlink",
       targetPath: normalizeExpectedPath(path.join(targetPath, "broken")),
+      linkTargetPath: normalizeExpectedPath(path.join(rootPath, "missing-source")),
     },
   ]);
   assert.deepEqual(result.diagnostics, [
@@ -490,6 +491,139 @@ test("restoreBackupToTarget overwrites target when confirmed without mutating ba
     await readFile(path.join(backupPath, "references", "info.md"), "utf8"),
     "backup reference",
   );
+});
+
+test("renameManagedSymlink recreates a managed link at the renamed target path", async () => {
+  const rootPath = await createTempPath("ssm-target-rename-symlink-");
+  const oldSourcePath = path.join(rootPath, "repo", "skills", "alpha");
+  const newSourcePath = path.join(rootPath, "repo", "skills", "beta");
+  const targetRootPath = path.join(rootPath, "target");
+  const oldTargetPath = path.join(targetRootPath, "alpha");
+  const newTargetPath = path.join(targetRootPath, "beta");
+  await createSourceSkill(newSourcePath, {});
+  await mkdir(targetRootPath, { recursive: true });
+  await symlink(oldSourcePath, oldTargetPath, "dir");
+  const store = new FileSystemTargetStore();
+
+  const result = await store.renameManagedSymlink({
+    oldTargetPath,
+    newTargetPath,
+    sourcePath: newSourcePath,
+  });
+
+  assert.equal(result.ok, true);
+  await assert.rejects(() => lstat(oldTargetPath), { code: "ENOENT" });
+  assert.equal((await lstat(newTargetPath)).isSymbolicLink(), true);
+  assert.equal(await readFile(path.join(newTargetPath, "SKILL.md"), "utf8"), "source");
+});
+
+test("renameManagedCopy preserves body while updating name and metadata", async () => {
+  const rootPath = await createTempPath("ssm-target-rename-copy-");
+  const targetRootPath = path.join(rootPath, "target");
+  const oldTargetPath = path.join(targetRootPath, "alpha");
+  await mkdir(oldTargetPath, { recursive: true });
+  await writeFile(path.join(oldTargetPath, "SKILL.md"), "---\nname: alpha\n---\n\ncustom alpha body\n");
+  await writeFile(path.join(oldTargetPath, ".sponzey-applied.json"), "{}\n");
+  const store = new FileSystemTargetStore();
+
+  const result = await store.renameManagedCopy({ oldTargetPath, targetRootPath, skillName: "beta", metadata: { sourceSkillId: "stable", sourcePath: "/repo/skills/beta" } });
+
+  assert.equal(result.ok, true);
+  assert.equal(await readFile(path.join(targetRootPath, "beta", "SKILL.md"), "utf8"), "---\nname: beta\n---\n\ncustom alpha body\n");
+  assert.deepEqual(JSON.parse(await readFile(path.join(targetRootPath, "beta", ".sponzey-applied.json"), "utf8")), { sourceSkillId: "stable", sourcePath: "/repo/skills/beta" });
+});
+
+test("renameManagedCopy restores the original directory when manifest writing fails", async () => {
+  const rootPath = await createTempPath("ssm-target-rename-copy-rollback-");
+  const targetRootPath = path.join(rootPath, "target");
+  const oldTargetPath = path.join(targetRootPath, "alpha");
+  await mkdir(oldTargetPath, { recursive: true });
+  await writeFile(path.join(oldTargetPath, "SKILL.md"), "---\nname: alpha\n---\n\ncustom body\n");
+  await writeFile(path.join(oldTargetPath, ".sponzey-applied.json"), "{\"before\":true}\n");
+  const store = new FileSystemTargetStore({
+    fileSystem: {
+      async writeFile(filePath, contents) {
+        if (filePath === path.join(targetRootPath, "beta", "SKILL.md")) {
+          const error = new Error("write failed");
+          error.code = "EIO";
+          throw error;
+        }
+        return writeFile(filePath, contents);
+      },
+    },
+  });
+
+  const result = await store.renameManagedCopy({
+    oldTargetPath,
+    targetRootPath,
+    skillName: "beta",
+    metadata: { sourceSkillId: "stable" },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryRequired, undefined);
+  assert.equal(result.error.code, "target-rename-rolled-back");
+  assert.equal(await readFile(path.join(oldTargetPath, "SKILL.md"), "utf8"), "---\nname: alpha\n---\n\ncustom body\n");
+  await assert.rejects(() => lstat(path.join(targetRootPath, "beta")), { code: "ENOENT" });
+});
+
+test("renameManagedSymlink removes its new link when removing the old link fails", async () => {
+  const rootPath = await createTempPath("ssm-target-rename-symlink-rollback-");
+  const sourcePath = path.join(rootPath, "repo", "skills", "beta");
+  const targetRootPath = path.join(rootPath, "target");
+  const oldTargetPath = path.join(targetRootPath, "alpha");
+  const newTargetPath = path.join(targetRootPath, "beta");
+  await createSourceSkill(sourcePath, {});
+  await mkdir(targetRootPath, { recursive: true });
+  await symlink(sourcePath, oldTargetPath, "dir");
+  const store = new FileSystemTargetStore({
+    fileSystem: {
+      async unlink(filePath) {
+        if (filePath === oldTargetPath) {
+          const error = new Error("unlink failed");
+          error.code = "EACCES";
+          throw error;
+        }
+        return (await import("node:fs/promises")).unlink(filePath);
+      },
+    },
+  });
+
+  const result = await store.renameManagedSymlink({ oldTargetPath, newTargetPath, sourcePath });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryRequired, undefined);
+  assert.equal(result.error.code, "target-rename-rolled-back");
+  assert.equal((await lstat(oldTargetPath)).isSymbolicLink(), true);
+  await assert.rejects(() => lstat(newTargetPath), { code: "ENOENT" });
+});
+
+test("renameManagedSymlink reports RecoveryRequired when its compensating unlink also fails", async () => {
+  const rootPath = await createTempPath("ssm-target-rename-symlink-recovery-");
+  const sourcePath = path.join(rootPath, "repo", "skills", "beta");
+  const targetRootPath = path.join(rootPath, "target");
+  const oldTargetPath = path.join(targetRootPath, "alpha");
+  const newTargetPath = path.join(targetRootPath, "beta");
+  await createSourceSkill(sourcePath, {});
+  await mkdir(targetRootPath, { recursive: true });
+  await symlink(sourcePath, oldTargetPath, "dir");
+  const store = new FileSystemTargetStore({
+    fileSystem: {
+      async unlink() {
+        const error = new Error("unlink failed");
+        error.code = "EACCES";
+        throw error;
+      },
+    },
+  });
+
+  const result = await store.renameManagedSymlink({ oldTargetPath, newTargetPath, sourcePath });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.recoveryRequired, true);
+  assert.equal(result.error.code, "target-rename-recovery-required");
+  assert.equal((await lstat(oldTargetPath)).isSymbolicLink(), true);
+  assert.equal((await lstat(newTargetPath)).isSymbolicLink(), true);
 });
 
 async function createTargetSkill(skillPath, extraFiles) {

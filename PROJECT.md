@@ -159,6 +159,10 @@ code-reviewer/
 
 `SKILL.md`는 이름, 설명, 사용 조건, 절차, 도구 의존성, 보안 제한 등을 포함할 수 있다.
 
+원본 스킬로 저장되는 폴더는 루트에 읽을 수 있는 일반 파일 `SKILL.md`를 반드시 가져야 한다. Create, Import, Install, Copy, Move, Archive Import, Backup Promote는 staging 경로에서 이 조건을 확인하고, 최종 경로로 옮긴 뒤에도 다시 읽어 목록 발견이 확인될 때만 성공으로 보고한다. 검증 실패 시 새 원본은 제거하며, 제거마저 실패하면 `RecoveryRequired` 진단을 남겨 부분 상태를 숨기지 않는다.
+
+`Rename Source Skill`은 source directory와 원본 `SKILL.md`의 top-level `name`을 함께 바꾸고 stable `sourceId`는 유지한다. 접근 가능한 exact managed Global/Project placement만 함께 이름을 바꾼다. modified copy는 명시 확인 없이는 변경하지 않으며 external skill, backup, free text는 변경 대상이 아니다. 닫힌 프로젝트나 끊어진 alias는 자동 수정하지 않고, 다시 열었을 때 Diagnostics에서 사용자가 승인한 동기화만 허용한다.
+
 ### 5.2 Main Skill Repository
 
 메인 스킬 리포지토리는 Sponzey Skills Manager가 원본 스킬을 저장하는 로컬 디렉터리다.
@@ -859,7 +863,7 @@ VSCode settings 예시:
 | `mainRepositoryPath`            | 원본 스킬을 저장하는 로컬 디렉터리                                     |
 | `defaultApplyMode`              | 기본 적용 방식: `symlink` 또는 `copy`                           |
 | `enabledClients`                | 관리할 agent client 목록                                     |
-| `globalTargets`                 | 표준 target 외에 사용자가 명시적으로 추가한 전역 target                       |
+| `globalTargets`                 | 표준 target 외에 사용자가 명시적으로 추가한 전역 target                   |
 | `projectTargetPatterns`         | 프로젝트 내부에서 스캔할 스킬 target 상대 경로                           |
 | `blockCriticalRiskApply`        | Critical 위험 스킬 적용 차단 여부                                 |
 | `warnHighRiskApply`             | High 위험 스킬 적용 전 경고 여부                                   |

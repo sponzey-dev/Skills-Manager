@@ -23,6 +23,7 @@ export async function copyAppliedSkillToMainRepository({
     return transferFailed({
       diagnostics: [copyResult.error],
       steps: [...steps, failureStepForRepositoryError(copyResult.error)],
+      recoveryRequired: copyResult.recoveryRequired,
     });
   }
 
@@ -144,6 +145,7 @@ export async function moveAppliedSkillToMainRepository({
     return transferFailed({
       diagnostics: [copyResult.error],
       steps: [...steps, failureStepForRepositoryError(copyResult.error)],
+      recoveryRequired: copyResult.recoveryRequired,
     });
   }
 
@@ -183,8 +185,8 @@ export async function moveAppliedSkillToMainRepository({
   };
 }
 
-function transferFailed({ diagnostics, steps }) {
-  return {
+function transferFailed({ diagnostics, steps, recoveryRequired = false }) {
+  const result = {
     ok: false,
     diagnostics,
     events: [
@@ -196,11 +198,21 @@ function transferFailed({ diagnostics, steps }) {
     ],
     steps,
   };
+  if (recoveryRequired) result.recoveryRequired = true;
+  return result;
 }
 
 function failureStepForRepositoryError(error) {
   if (error?.code === "source-name-conflict") {
     return "NameConflictBlocked";
+  }
+
+  if (typeof error?.code === "string" && error.code.startsWith("source-skill-md-")) {
+    return "VerificationFailed";
+  }
+
+  if (error?.code === "source-cleanup-failed") {
+    return "RecoveryRequired";
   }
 
   return "WriteFailed";

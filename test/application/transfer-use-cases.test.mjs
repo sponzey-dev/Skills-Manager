@@ -347,6 +347,43 @@ test("moveAppliedSkillToMainRepository does not cleanup target after copy confli
   ]);
 });
 
+test("moveAppliedSkillToMainRepository keeps target when copied source fails verification", async () => {
+  let removeCalled = false;
+  const result = await moveAppliedSkillToMainRepository({
+    context: { mainRepositoryPath: "/repo" },
+    input: {
+      target: globalTarget(),
+      appliedSkill: appliedExternalSkill(),
+      sourceName: "external",
+      cleanupConfirmed: true,
+    },
+    skillRepository: {
+      async copyTargetSkillToMainRepository() {
+        return {
+          ok: false,
+          error: {
+            code: "source-skill-md-missing",
+            severity: "error",
+            message: "Source skill must contain SKILL.md at its root.",
+            recommendation: "Choose a skill folder that contains SKILL.md at its root.",
+          },
+        };
+      },
+    },
+    targetStore: {
+      async removeTargetEntry() {
+        removeCalled = true;
+        return { ok: true };
+      },
+    },
+  });
+
+  assert.equal(removeCalled, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0].code, "source-skill-md-missing");
+  assert.equal(result.steps.at(-1), "VerificationFailed");
+});
+
 function globalTarget() {
   return {
     id: "global:codex",

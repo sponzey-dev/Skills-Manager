@@ -12,6 +12,7 @@ const SUPPORTED_ACTION_CODES = Object.freeze([
   "apply-skill-to-target",
   "restore-backup",
   "delete-backup",
+  "synchronize-managed-skill-name",
 ]);
 
 export function resolveDiagnosticActionCommand({
@@ -117,6 +118,14 @@ function commandInputForAction({ actionCode, item }) {
     return input;
   }
 
+  if (actionCode === "synchronize-managed-skill-name") {
+    return {
+      source: item?.source,
+      diagnostic: item?.diagnostic,
+      confirmationProvided: true,
+    };
+  }
+
   return {
     diagnostic: item?.diagnostic,
   };
@@ -141,6 +150,10 @@ function commandIdForAction({ actionCode, item }) {
 
   if (actionCode === "delete-backup") {
     return "sponzeySkills.deleteBackup";
+  }
+
+  if (actionCode === "synchronize-managed-skill-name") {
+    return "sponzeySkills.synchronizeManagedSkillName";
   }
 
   return COMMAND_BY_SAFE_ACTION_CODE[actionCode];

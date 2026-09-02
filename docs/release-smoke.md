@@ -44,10 +44,12 @@
 
 - [ ] Main Repository에 source skill을 생성한다.
 - [ ] local skill folder를 Main Repository로 import한다.
+- [ ] root `SKILL.md`가 없는 local folder import는 reason code가 있는 error를 표시하고 Main Repository에 partial source를 남기지 않는다.
 - [ ] Git URL 또는 local path install이 source skill을 Main Repository에 추가한다.
 - [ ] Import Skill Archive가 archive command를 통해 source skill 또는 backup bundle을 추가한다.
 - [ ] Open Source Folder가 source folder를 연다.
 - [ ] Delete Source Skill이 Remove Applied Skill과 명확히 구분된다.
+- [ ] Rename Source Skill은 source folder와 root `SKILL.md name:`을 함께 변경하고 stable sourceId를 유지한다. 열린 managed symlink/copy만 동기화하며 modified copy는 명시 확인을 요구한다.
 
 ## 6. Global 및 Project 적용
 

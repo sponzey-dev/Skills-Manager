@@ -36,6 +36,7 @@ import {
   restoreBackupToTarget,
   setMainRepository,
   showDiagnostics,
+  synchronizeManagedSkillName,
   updateAppliedCopyFromSource,
 } from "./application/index.js";
 import {
@@ -360,7 +361,13 @@ function createUseCaseBundle({
         context,
         input,
         skillRepository,
+        repositoryIndexStore,
+        hashPort,
+        targetStore,
       });
+    },
+    async synchronizeManagedSkillName({ context, input }) {
+      return synchronizeManagedSkillName({ context, input, targetStore });
     },
     async deleteSourceSkill({ context, input }) {
       return deleteSourceSkill({

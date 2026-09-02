@@ -467,6 +467,34 @@ test("wrapCommandHandlerWithResultRendering returns cancelled result without ren
   assert.deepEqual(calls, []);
 });
 
+test("renderCommandResult reports source manifest failure without a raw path", async () => {
+  const calls = [];
+
+  await renderCommandResult({
+    result: {
+      ok: false,
+      diagnostics: [
+        {
+          code: "source-skill-md-missing",
+          severity: "error",
+          message: "Source skill must contain SKILL.md at its root.",
+          recommendation: "Choose a skill folder that contains SKILL.md at its root.",
+          sourcePath: "/private/source/missing-manifest",
+        },
+      ],
+    },
+    window: fakeWindow(calls),
+  });
+
+  assert.deepEqual(calls, [
+    [
+      "error",
+      "Sponzey Skills: source-skill-md-missing - Source skill must contain SKILL.md at its root.",
+    ],
+  ]);
+  assert.equal(calls[0][1].includes("/private"), false);
+});
+
 function fakeWindow(calls) {
   return {
     async showInformationMessage(message) {
